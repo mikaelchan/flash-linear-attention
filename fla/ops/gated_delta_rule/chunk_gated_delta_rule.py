@@ -12,6 +12,7 @@ import math
 
 _LOG2E = 1.4426950408889634
 
+
 @functools.lru_cache(maxsize=32)
 def fused_prepare_compute_w_u_tl(
     total_chunks: int,
@@ -232,13 +233,14 @@ def fused_prepare_compute_w_u_tl(
 
     return _func
 
+
 @functools.lru_cache(maxsize=32)
 def _h_recurrence_tl(
+    total_chunks: int,
     total_tokens: int,
     batch: int,
     head: int,
     chunk_size: int,
-    max_chunks: int,
     dim_k: int,
     dim_v: int,
     dtype: str = "float16",
@@ -262,14 +264,20 @@ def _h_recurrence_tl(
             g: T.Tensor([total_tokens, head], dtype),
             w: T.Tensor([total_tokens, head, dim_k], dtype),
             u: T.Tensor([total_tokens, head, dim_v], dtype),
-            cu_seqlens: T.Tensor([batch+1], "int32"),
+            cu_seqlens: T.Tensor([batch + 1], "int32"),
+            chunk_offsets: T.Tensor([batch + 1], "int32"),
             S_0: T.Tensor([batch, head, dim_k, dim_v], dtype),
-            S: T.Tensor([batch, head, max_chunks+1, dim_k, dim_v], dtype),
+            S: T.Tensor([total_chunks, head, dim_k, dim_v], dtype),
             v_new: T.Tensor([total_tokens, head, dim_v], dtype),
         ):
-            with T.Kernel(dim_v//block_DV, batch, head, threads=threads) as (vid, bid, hid):
+            with T.Kernel(dim_v // block_DV, batch, head, threads=threads) as (
+                vid,
+                bid,
+                hid,
+            ):
                 seq_start = cu_seqlens[bid]
                 seq_end = cu_seqlens[bid + 1]
+                cid = chunk_offsets[bid]
                 seqlen = seq_end - seq_start
                 num_chunks = (seqlen + block_C - 1) // block_C
 
@@ -287,9 +295,10 @@ def _h_recurrence_tl(
 
                 # initialize h
                 T.copy(
-                    S_0[bid, hid, :, v_offset : v_offset + block_DV], h_c, disable_tma=True
+                    S_0[bid, hid, :, v_offset : v_offset + block_DV],
+                    h_c,
+                    disable_tma=True,
                 )
-                T.copy(h_c, S[bid, hid, 0, :, v_offset: v_offset+block_DV], disable_tma=True)
 
                 for t in T.Pipelined(num_chunks, num_stages=num_stages):
                     chunk_token_start = seq_start + t * block_C
@@ -305,7 +314,11 @@ def _h_recurrence_tl(
                         w_c[:actual_len, :],
                     )
                     T.copy(
-                        u[chunk_token_start : chunk_token_start + actual_len, hid, v_offset : v_offset + block_DV],
+                        u[
+                            chunk_token_start : chunk_token_start + actual_len,
+                            hid,
+                            v_offset : v_offset + block_DV,
+                        ],
                         u_c[:actual_len, :],
                     )
                     T.copy(
@@ -314,15 +327,24 @@ def _h_recurrence_tl(
                     )
 
                     g_last_val = g_c[actual_len - 1]
-                    T.gemm(w_c[:actual_len, :], h_c, ws_frag[:actual_len, :], clear_accum=True)
+                    T.gemm(
+                        w_c[:actual_len, :],
+                        h_c,
+                        ws_frag[:actual_len, :],
+                        clear_accum=True,
+                    )
                     for i, j in T.Parallel(actual_len, block_DV):
                         v_new_c[i, j] = u_c[i, j] - ws_frag[i, j] * T.exp2(
-                            (g_c[i] + g_last_val) * _LOG2E
+                            g_c[i] * _LOG2E
                         )
 
                     T.copy(
                         v_new_c[:actual_len, :],
-                        v_new[chunk_token_start : chunk_token_start + actual_len, hid, v_offset : v_offset + block_DV],
+                        v_new[
+                            chunk_token_start : chunk_token_start + actual_len,
+                            hid,
+                            v_offset : v_offset + block_DV,
+                        ],
                     )
 
                     for n, kk in T.Parallel(actual_len, dim_k):
@@ -338,10 +360,16 @@ def _h_recurrence_tl(
                         transpose_A=True,
                     )
                     T.copy(h_next_frag, h_c)
-                    T.copy(h_c, S[bid, hid, t+1, :, v_offset: v_offset+block_DV], disable_tma=True)
+                    T.copy(
+                        h_c,
+                        S[cid + t, hid, :, v_offset : v_offset + block_DV],
+                        disable_tma=True,
+                    )
+
         return h_recurrence_kernel
 
     return _func
+
 
 @functools.lru_cache(maxsize=32)
 def _output_o_tl(
@@ -374,9 +402,9 @@ def _output_o_tl(
             q: T.Tensor([total_tokens, head_q, dim_k], dtype),
             k: T.Tensor([total_tokens, head_kv, dim_k], dtype),
             g: T.Tensor([total_tokens, head_kv], dtype),
-            cu_seqlens: T.Tensor([batch+1], "int32"),
-            chunk_offsets: T.Tensor([batch+1], "int32"),
-            S: T.Tensor([total_tokens, head, dim_k, dim_v], dtype),
+            cu_seqlens: T.Tensor([batch + 1], "int32"),
+            chunk_offsets: T.Tensor([batch + 1], "int32"),
+            S: T.Tensor([total_tokens, head_kv, dim_k, dim_v], dtype),
             v_new: T.Tensor([total_tokens, head_kv, dim_v], dtype),
             o: T.Tensor([total_tokens, head_q, dim_v], dtype),
         ):
@@ -406,62 +434,40 @@ def _output_o_tl(
                 q_c = T.alloc_shared([block_C, dim_k], dtype)
                 k_c = T.alloc_shared([block_C, dim_k], dtype)
                 g_c = T.alloc_shared([block_C], dtype)
-                h_c = T.alloc_shared([dim_k, dim_v], dtype)
-                v_new_c = T.alloc_shared([block_C, dim_v], dtype)
+                h_c = T.alloc_shared([dim_k, block_DV], dtype)
+                v_new_c = T.alloc_shared([block_C, block_DV], dtype)
                 attn = T.alloc_shared([block_C, block_C], dtype)
+                o_c = T.alloc_shared([block_C, block_DV], dtype)
+                o_frag = T.alloc_fragment([block_C, block_DV], accum_dtype)
+                attn_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
 
-                T,copy(q[])
-                # 1. 加载 q（使用 q_hid）
-                for i in T.serial(block_C):
-                    cond = i < actual_len
-                    off = chunk_token_start + i
-                    for d in T.serial(dim_k):
-                        q_c[i, d] = T.if_then_else(cond, q[off, q_hid, d], 0.0)
-
-                # 2. 加载 k, g（使用 kv_hid）
-                for i in T.serial(block_C):
-                    cond = i < actual_len
-                    off = chunk_token_start + i
-                    for d in T.serial(dim_k):
-                        k_c[i, d] = T.if_then_else(cond, k[off, kv_hid, d], 0.0)
-                    g_c[i] = T.if_then_else(cond, g[off, kv_hid], 0.0)
-
-                # 3. 加载隐藏状态 h = S[batch_idx, kv_hid, local_chunk_idx]
-                T.copy(S[batch_idx, kv_hid, local_chunk_idx, :, :], h_c, disable_tma=True)
-
-                # 4. 加载 v_new（使用 kv_hid）
-                for i in T.serial(block_C):
-                    cond = i < actual_len
-                    off = chunk_token_start + i
-                    for d in T.serial(dim_v):
-                        v_new_c[i, d] = T.if_then_else(cond, v_new[off, kv_hid, d], 0.0)
-
-                # 5. 计算 o = (q @ h) * exp(g)
-                T.clear(o_frag)
-                T.gemm(q_c, h_c, o_frag)
-                for i, j in T.Parallel(block_C, dim_v):
-                    if i < actual_len:
+                T.copy(
+                    q[chunk_token_start:chunk_token_end, q_hid, :], q_c[:actual_len, :]
+                )
+                T.copy(
+                    k[chunk_token_start:chunk_token_end, kv_hid, :], k_c[:actual_len, :]
+                )
+                T.copy(g[:actual_len, kv_hid], g_c[:actual_len])
+                for i_v in T.Pipelined(dim_v // block_DV, num_stages=num_stages):
+                    v_offset = i_v * block_DV
+                    T.copy(S[tid, kv_hid, :, v_offset : v_offset + block_DV], h_c)
+                    T.copy(v_new[chunk_token_start:chunk_token_end, kv_hid, :, v_offset:v_offset+block_DV], v_new_c[:actual_len,:])
+                    T.gemm(q_c, h_c, o_frag, clear_accum=True)
+                    for i, j in T.Parallel(block_C, block_DV):
                         o_frag[i, j] = o_frag[i, j] * T.exp2(g_c[i] * _LOG2E)
+                    T.gemm(q_c, k_c, attn_frag, transpose_B=True, clear_accum=True)
 
-                # 6. 计算块内注意力 attn
-                T.clear(attn_frag)
-                T.gemm(q_c, k_c, attn_frag, transpose_B=True)
-                for i, j in T.Parallel(block_C, block_C):
-                    if i < actual_len and j < actual_len and i >= j:
-                        attn[i, j] = attn_frag[i, j] * T.exp2((g_c[i] - g_c[j]) * _LOG2E)
-                    else:
-                        attn[i, j] = 0.0
+                    for i, j in T.Parallel(block_C, block_C):
+                        attn[i, j] = T.if_then_else(i < actual_len and j <= i, attn_frag[i, j] * T.exp2((g_c[i] - g_c[j]) * _LOG2E), T.float32(0))
 
-                # 7. o += attn @ v_new
-                T.gemm(attn, v_new_c, o_frag)
+                    T.gemm(attn, v_new_c, o_frag)
 
-                # 8. 写回 o（使用 q_hid）
-                for i in T.serial(block_C):
-                    cond = i < actual_len
-                    off = chunk_token_start + i
-                    for d in T.serial(dim_v):
-                        if cond:
-                            o[off, q_hid, d] = o_frag[i, d]
+                    T.copy(o_frag[:actual_len, :], o_c[:actual_len, :])
+                    T.copy(
+                        o_c[:actual_len, :],
+                        o[chunk_token_start : chunk_token_start + actual_len, q_hid, v_offset : v_offset + block_DV],
+                    )
+        return output_o_kernel
     return _func
 
 
@@ -491,7 +497,6 @@ def chunk_gated_delta_rule(
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     chunks_per_batch = (seq_lens + chunk_size - 1) // chunk_size
     total_chunks = chunks_per_batch.sum().item()
-    max_chunks = chunks_per_batch.max().item()
     chunk_offsets = torch.cat(
         [torch.tensor([0], device=cu_seqlens.device), chunks_per_batch.cumsum(0)]
     )
@@ -524,3 +529,75 @@ def chunk_gated_delta_rule(
     o = o_fn(q, k, g, cu_seqlens, chunk_offsets, S_buf, v_new)
 
     return o, S_buf
+
+
+def main(
+    batch: int = 1,
+    heads: int = 1,
+    seq_q: int = 256,
+    seq_kv: int = 256,
+    dim: int = 64,
+    is_causal: bool = False,
+    tune: bool = False,
+):
+    flops_per_matmul = 2.0 * batch * heads * seq_q * seq_kv * dim
+    total_flops = 2 * flops_per_matmul
+    if is_causal:
+        total_flops *= 0.5
+
+    if not tune:
+        kernel = flashattn(
+            batch,
+            heads,
+            seq_q,
+            seq_kv,
+            dim,
+            is_causal,
+            block_M=64,
+            block_N=64,
+            num_stages=1,
+            threads=128,
+        )
+        ref_program_processed = partial(ref_program, is_causal=is_causal)
+
+        profiler = kernel.get_profiler()
+        profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
+        print("All checks pass.")
+        latency = profiler.do_bench(ref_program_processed, warmup=500)
+        print("Ref: {:.2f} ms".format(latency))
+        print("Ref: {:.2f} TFlops".format(total_flops / latency * 1e-9))
+        latency = profiler.do_bench(warmup=500)
+        print("Tile-lang: {:.2f} ms".format(latency))
+        print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
+    else:
+        kernel = flashattn(batch, heads, seq_q, seq_kv, dim, is_causal)
+        best_latency = kernel.latency
+        best_config = kernel.config
+        ref_latency = kernel.ref_latency
+        print(f"Best latency: {best_latency}")
+        print(f"Best TFlops: {total_flops / best_latency * 1e-9}")
+        print(f"Best config: {best_config}")
+        print(f"Ref latency: {ref_latency}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, default=1, help="batch size")
+    parser.add_argument("--heads", type=int, default=1, help="heads")
+    parser.add_argument("--seq_q", type=int, default=256, help="query sequence length")
+    parser.add_argument(
+        "--seq_kv", type=int, default=256, help="key/value sequence length"
+    )
+    parser.add_argument("--dim", type=int, default=64, help="dim")
+    parser.add_argument("--is_causal", action="store_true", help="causal")
+    parser.add_argument("--tune", action="store_true", help="tune configs")
+    args = parser.parse_args()
+    main(
+        args.batch,
+        args.heads,
+        args.seq_q,
+        args.seq_kv,
+        args.dim,
+        args.is_causal,
+        args.tune,
+    )
